@@ -1,6 +1,6 @@
 # Proyecto Lenguaje de Señas
 
-Este proyecto tiene como objetivo ayudar a las personas a aprender el lenguaje de señas mexicano. 
+Este proyecto tiene como objetivo ayudar a las personas a aprender y traducir el lenguaje de señas mexicano. 
 
 ## Instalación
 
