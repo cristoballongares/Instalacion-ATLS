@@ -1,0 +1,129 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\lstdefinestyle{pystyle}{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{teal},
+    numbers=left,
+    numberstyle=\tiny,
+    breaklines=true,
+    frame=single,
+    showstringspaces=false
+}
+\lstset{style=pystyle}
+
+\title{ATLS TALKHAND: A Webcam-Based Recognizer for LSM Fingerspelling}
+\author{Cristobal Longares \\ Ingenier\'ia en Sistemas Computacionales, ITZ}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report documents ATLS TALKHAND, a student project built to recognize fingerspelled vowels from Mexican Sign Language (Lengua de Se\~nas Mexicana, LSM) using a webcam. The recognition side is a Python script that reads hand landmarks with MediaPipe and classifies handshapes through joint-angle thresholds computed with the law of cosines, not a trained classifier. A separate .NET 7 WinForms application hosts the lesson screens the user interacts with, and the two communicate through a plain JSON file written to disk. I go over how the geometry actually works, how the two halves of the application talk to each other, what is and is not covered by the current implementation (five vowels, no full alphabet), and a few things that did not go well, including a bug in an abandoned motion-based detector and some project management mistakes around what actually got committed to version control.
+\end{abstract}
+
+\section{Problem Statement}
+
+Most introductory material for learning LSM fingerspelling is static: a poster, a PDF, a video. None of it tells you whether your hand is actually forming the letter correctly, you are left comparing your hand to a picture and guessing. The goal of this project was to build something that gives that feedback live, using a normal laptop webcam and no specialized hardware.
+
+I scoped the recognition problem down to vowels first (A, E, I, O, U) because their handshapes are distinct enough from each other, in terms of which fingers are extended versus curled, to be told apart using simple geometric thresholds on joint angles. That let me avoid the much larger effort of collecting a labeled dataset and training a classifier, which would have been necessary to cover a full alphabet where several letters share similar handshapes and are told apart by orientation or motion instead.
+
+\section{Methodology and Implementation}
+
+\subsection{Hand Landmark Detection}
+
+The pipeline uses MediaPipe's \texttt{Hands} solution to get 21 3D landmarks per detected hand from each webcam frame. I did not train or fine-tune this model, it is used as-is; the actual engineering work in this project sits on top of its output. The main loop configures it as:
+
+\begin{lstlisting}
+with mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        min_detection_confidence=0.75) as hands:
+\end{lstlisting}
+
+\subsection{From Landmarks to Joint Angles}
+
+The function \texttt{obtenerAngulos} in \texttt{normalizacionCords.py} converts landmark coordinates into joint flexion angles. For each of six tracked joints, pinky, ring finger, middle finger, index finger, and two on the thumb (outer and inner), it takes three landmarks (tip, PIP, and MCP for the four main fingers; TIP, IP/MCP, and wrist for the thumb pair), scales their normalized MediaPipe coordinates by the frame's width and height, and computes the three side lengths of the triangle those three points form using \texttt{np.linalg.norm}. The joint angle then follows from the law of cosines:
+
+\[
+\cos(\theta) = \frac{l_1^2 + l_3^2 - l_2^2}{2 \, l_1 \, l_3}
+\]
+
+where $l_1, l_2, l_3$ are the pairwise distances between the three landmarks for that joint. The code guards against the two ways this can misbehave: a zero-length side (which would divide by zero) and a ratio that falls outside $[-1, 1]$ (which would make \texttt{acos} raise a domain error), defaulting the angle to $0$ in either case rather than crashing.
+
+\begin{lstlisting}
+if l1 and l3 != 0 and -1 < num_den1 < 1:
+    angle1 = round(degrees(abs(acos(num_den1))))
+else:
+    angle1 = 0
+\end{lstlisting}
+
+One detail worth flagging here: the \texttt{return} statement in \texttt{obtenerAngulos} sits inside the \texttt{for hand\_landmarks in results.multi\_hand\_landmarks} loop. That means the function always returns after processing the first hand MediaPipe finds, even though the calling code configures \texttt{max\_num\_hands=2}. In practice this was never a problem, since fingerspelling only needs one hand, but it does mean the two-hand configuration in \texttt{app.py} was never doing anything.
+
+\subsection{From Angles to Letters}
+
+The main loop (\texttt{app.py}) turns the six angles into a binary vector, one entry per finger, marking it "up" if the angle clears a threshold: 125\textdegree{} for the thumb's outer joint, 150\textdegree{} for the thumb's inner joint, and 90\textdegree{} for the remaining four fingers. These thresholds were tuned by testing in front of my own webcam, there is no labeled dataset behind them and no accuracy measurement, which is the main limitation of the whole approach and is discussed further in Section~\ref{sec:limitations}.
+
+\texttt{condicionales.py} then matches this six-value vector against hardcoded patterns for each vowel. For example:
+
+\begin{lstlisting}
+def obtenerA(dedos, frame):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    if dedos == [1, 1, 0, 0, 0, 0]:
+            cv2.rectangle(frame, (0, 0), (100, 100), (255, 255, 255), -1)
+            cv2.putText(frame, 'A', (20, 80), font, 3, (0, 0, 0), 2, cv2.LINE_AA)
+            data = {"valor_booleanoA": True}
+            with open("info.json", "w") as f:
+                 json.dump(data, f)
+\end{lstlisting}
+
+Each of the five \texttt{obtener*} functions (\texttt{obtenerA}, \texttt{obtenerE}, \texttt{obtenerI}, \texttt{obtenerO}, \texttt{obtenerU}) follows this same shape: check the finger vector against the pattern for that letter, draw a small overlay box and label on the frame if it matches, and write a boolean flag to \texttt{info.json} either way. There is also a combined \texttt{condicionalesLetras} function that runs the same five checks in sequence and ends with a comment, \texttt{\# abecedario}, that I left myself as a reminder that this was meant to eventually cover the full alphabet. It did not get there in this version of the project.
+
+\subsection{An Abandoned Attempt at "J"}
+
+Unlike the vowels, "J" in LSM fingerspelling involves motion, not just a static handshape. I tried to detect it in \texttt{app.py} by tracking the vertical pixel position of the pinky tip across frames and firing a match if it moved more than 30 pixels between two consecutive frames:
+
+\begin{lstlisting}
+pinky = obtenerAngulos(results, width, height)[1]
+pinkY = pinky[1] + pinky[0]
+resta = pinkY - lectura_actual
+lectura_actual = pinkY
+if dedos == [0, 0, 1, 0, 0, 0]:
+    if abs(resta) > 30:
+        cv2.rectangle(frame, (0, 0), (100, 100), (0, 0,  ), -1)
+        cv2.putText(frame, 'J', (20, 80), font, 3, (0, 0, 0), 2, cv2.LINE_AA)
+\end{lstlisting}
+
+This has a bug: the color argument passed to \texttt{cv2.rectangle} is \texttt{(0, 0, )}, a two-value tuple, where OpenCV expects a three-value BGR color. If this branch had actually triggered during a run, it would have raised an error. This is very likely why the "J" logic never made it out of \texttt{app.py} and into \texttt{condicionales.py} alongside the vowels that did ship.
+
+\subsection{Getting the Result Out of Python}
+
+Since the recognition logic runs in a Python process and the lesson UI is a separate .NET application, the two need a way to exchange state. The mechanism here is about as simple as it gets: every time a recognition function runs, it overwrites \texttt{ATLS/info.json} with a small JSON object, for example \texttt{\{"valor\_booleanoA": true\}} or the placeholder state \texttt{\{"letra": "x"\}} that ships with the repo. There is no locking and no versioning on that file, whichever process reads or writes it last wins. It works for a single-user desktop demo, but it is not something I would reuse for anything with real concurrency.
+
+\subsection{Packaging}
+
+The Python side is frozen into a standalone executable with cx\_Freeze, bundling a Python 3.8 interpreter together with OpenCV and MediaPipe's compiled extensions, so it can run on a machine that does not have Python installed. The .NET side is a WinForms application targeting .NET 7 (namespace \texttt{ATLS\_TALKHAND}, five forms), built separately and shipped as compiled binaries. It embeds IronPython and IronPython.StdLib, and uses Newtonsoft.Json to parse \texttt{info.json}, so it can react to whatever the Python process last wrote there.
+
+\section{Results / How It Behaves}
+
+In its current state, the system reliably distinguishes the five vowel handshapes (A, E, I, O, U) from each other in front of a webcam under reasonable lighting, since each corresponds to a distinct combination of extended and curled fingers, and the angle thresholds were tuned against that. It does not recognize the rest of the LSM fingerspelling alphabet, and the one attempt at a motion-based letter ("J") is broken and unused. There is no quantitative accuracy evaluation in this project, no held-out test set, no confusion matrix, this was validated informally by using it myself, which is a limitation I want to be upfront about rather than imply otherwise.
+
+\section{Conclusions and Lessons Learned}
+\label{sec:limitations}
+
+Framing hand recognition as a geometry problem, angles between three landmarks compared against fixed thresholds, was enough to get five distinct handshapes working without needing to collect and label any training data. That was the right tradeoff for a first version, but it does not scale to the full alphabet, where multiple letters need finer distinctions than "is this finger up or down," and a few need motion. A proper next step would be logging a set of labeled frames per letter (a few hundred each, across different hands, distances and lighting) and fitting a small classifier on the same MediaPipe landmark features, instead of hand-tuning more degree cutoffs.
+
+A few things about how the project was managed also did not go well and are worth naming directly. The repository carries close to 130 MB of committed binaries, including two nearly identical cx\_Freeze builds with a full bundled Python runtime and OpenCV/MediaPipe extensions, which should have been a build artifact or a release download, not something tracked in git. The .NET/WinForms half of the project never had its source code (the \texttt{.cs} and \texttt{.resx} files behind its five forms) committed at all, only the compiled \texttt{.dll}/\texttt{.exe}/\texttt{.pdb} made it into version control, which means this repository cannot actually rebuild that half of the application from source. And \texttt{app.py}, the script that actually wires \texttt{normalizacionCords} and \texttt{condicionales} together into a webcam loop, was deleted from the tree in the same commit that added the frozen build, so what remains under \texttt{Funciones/} is real working code, but no longer a complete, runnable program by itself. All three are straightforward things to fix in a next iteration: a \texttt{.gitignore} for build output, committing the WinForms source, and keeping the Python entry point in the tree even after freezing it for distribution.
+
+\end{document}
